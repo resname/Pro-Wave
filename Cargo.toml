@@ -5,6 +5,8 @@ members = [
     "crates/prowave-project",
     "crates/prowave-garageband-import",
     "crates/prowave-rex",
+    "crates/prowave-plugin-host",
+    "crates/prowave-plugin-helper",
     "crates/prowave-app",
     "xtask",
 ]
