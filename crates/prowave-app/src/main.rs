@@ -416,7 +416,7 @@ impl App {
                 i18n::tr("Audio File…"),
                 &[
                     "wav", "wave", "aif", "aiff", "aifc", "flac", "mp3", "caf", "ogg", "oga",
-                    "m4a", "mp4",
+                    "m4a", "mp4", "rx2", "rex",
                 ],
             )
             .pick_file()

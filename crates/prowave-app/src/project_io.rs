@@ -1111,6 +1111,11 @@ pub fn bounces_dir() -> PathBuf {
     session_media_dir().join("bounces")
 }
 
+/// Where imported REX2 loops are decoded to WAV until the project is saved.
+pub fn rex_imports_dir() -> PathBuf {
+    session_media_dir().join("rex-imports")
+}
+
 /// A track's input from a project file, which can hold any number.
 fn input_source(channel: u16, stereo: bool) -> InputSource {
     let channel = channel.min(prowave_engine::MAX_INPUT_CHANNELS as u16 - 2);

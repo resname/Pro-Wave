@@ -3437,6 +3437,7 @@ dependencies = [
  "prowave-engine",
  "prowave-garageband-import",
  "prowave-project",
+ "prowave-rex",
  "rfd",
  "rhai",
  "rtrb",

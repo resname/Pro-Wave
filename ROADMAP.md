@@ -398,8 +398,9 @@ Done and merged into `main` (CHANGELOG.md, section Unreleased, has the details):
 - **GarageBand:** `GARAGEBAND-FORMAT-SPEC.md`, the `prowave-garageband-import` crate and
   File > Import > Other Projects… (audio files only; tempo, signature and arrangement are phase 2).
 - **REX2 loops:** `REX-FORMAT-SPEC.md` and the `prowave-rex` crate read `.rx2`/`.rex` (container,
-  tempo, slices and the DWOP decoder, with a matching writer for the tests). The app does not import
-  them yet, and 24-bit files decode through the 16-bit codec.
+  tempo, slices and the DWOP decoder, with a matching writer for the tests). **File > Import >
+  Audio File…** adds a loop as one audio region; a 24-bit loop is reduced to 16-bit samples (with a
+  warning). Slice-aware playback, the loop region and tempo following are still to come.
 - **Mixer** keeps whole channel strips visible on short windows.
 - **Repo health:** the merges that left stray lines in `main` were redone (PR #65, #66); Windows and
   macOS tests compile again.
