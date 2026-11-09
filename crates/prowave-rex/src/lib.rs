@@ -4,7 +4,9 @@
 //! `RECY`), its audio format (`SINF`), its slice table (`CAT SLCL` with one `SLCE` per slice)
 //! and one compressed waveform for the whole loop (`SDAT`, coded with DWOP). Slices do not
 //! store audio of their own: each one is a range of the decoded waveform, which is what lets a
-//! loop follow the project tempo.
+//! loop follow the project tempo. The reader also accepts the older AIFF-based `.rex` and
+//! `.rcy` files ReCycle wrote before REX2: their PCM sits in an AIFF `SSND` chunk and the
+//! tempo and slices in an `APPL` chunk signed `REX ` or `ReCy`.
 //!
 //! This crate turns a file into [`RexFile`]: the decoded waveform as `i16`, the tempo, the
 //! sample rate, and the slices as frame ranges with their flags. The file is treated as
@@ -24,6 +26,7 @@
 
 mod chunks;
 mod dwop;
+mod legacy;
 pub mod write;
 
 /// The rate assumed when `SINF` says zero, as the reference reader does.
@@ -86,8 +89,17 @@ impl RexSlice {
 }
 
 impl RexFile {
-    /// Reads a REX2 file. The message says what is wrong when the file cannot be used.
+    /// Reads a REX2 file, or a legacy AIFF-based `.rex`/`.rcy`. The message says what is wrong
+    /// when the file cannot be used.
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.starts_with(b"FORM") {
+            return legacy::parse(bytes);
+        }
+        Self::parse_rex2(bytes)
+    }
+
+    /// Reads the `CAT REX2` container.
+    fn parse_rex2(bytes: &[u8]) -> Result<Self, String> {
         let all = chunks::walk(bytes)?;
         let is_rex2 = all
             .iter()

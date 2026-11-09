@@ -7,7 +7,8 @@ rules it is written from, so the crate can be checked without a copy of the form
 Sources: the REX2 notes published with the `schwung-rex` reader
 (<https://github.com/charlesvestal/schwung-rex/blob/main/REX2_FORMAT.md>) and the VelociLoops
 format documentation (<https://velociloops.readthedocs.io/en/latest/format.html>). Both describe
-the same container; where they differ, the first was followed (see "Open questions" below).
+the same container; where they differ, the first was followed (see "Open questions" below). The
+legacy AIFF layout follows the VelociLoops reader's `loadLegacyAIFF`.
 
 ## Container
 
@@ -158,11 +159,39 @@ decoder will. The residual is `d = target - sum(S[0..p])`; `val` is `d` for `d >
 `(cs, rv, nb)` can code `val - acc` with the range coder, then updates its state exactly as the
 decoder does.
 
+## Legacy ReCycle files (`.rex`, `.rcy`)
+
+Before REX2, ReCycle wrote an ordinary AIFF (`FORM … AIFF`) with the loop's metadata in an
+`APPL` chunk:
+
+| Chunk | Contents |
+|:--|:--|
+| `COMM` | Channels, frame count, bit depth, and the sample rate as an 80-bit extended number |
+| `SSND` | Big-endian PCM after the offset and block-size header |
+| `MARK` | Optional markers; `Loop start` and `Loop end` name the loop region |
+| `APPL` | Signature `REX ` (exported loop) or `ReCy` (ReCycle document), then tempo and slices |
+
+Both APPL variants keep the tempo as BPM × 1000 (`REX ` at payload offset 16, `ReCy` at 14).
+
+- **`REX `**: magic `0xD1D1D1DA`; slice count at `0x0A`; one 12-byte record per slice at
+  `0x3F8` — start frame, length in frames, position in 1/16 PPQ ticks. The first record is the
+  selected slice.
+- **`ReCy`**: magic `0xD1DADED0`; analysis sensitivity at `0x14`; count at `0x9E`; one 8-byte
+  record per slice at `0xA0` — flags (bit 7 selected, low 7 bits state: 1 locked, 2 muted),
+  start frame, analysis points. A slice runs to the next slice's start, or to the loop end.
+  Unselected slices that have a state, or whose points fall at or below the sensitivity
+  filter, are dropped.
+
+The crate expands 8-bit PCM and reduces 24- and 32-bit PCM to its 16-bit samples, exactly as
+it does for REX2. The decoded PCM and the slice tables match the VelociLoops reference on its
+`120RexTest.rex` and `120RcyTest.rcy` fixtures.
+
 ## What Pro Wave reads
 
 Read: `CAT REX2`, `HEAD` (only the magic is looked for), `GLOB` (tempo), `RECY` (original
 tempo), `SINF` (channels, format, rate, frames, loop region), `SLCE` (slices and markers),
-`SDAT` (DWOP).
+`SDAT` (DWOP). Legacy files are read from `FORM AIFF`: `COMM`, `SSND`, the `Loop start` and
+`Loop end` markers, and the `REX `/`ReCy` `APPL` chunk.
 
 Not read: `CREI` (creator strings), the `CAT DEVL` chunks (`TRSH`, `EQ `, `COMP`), the PPQ
 length field, and the transient **Stretch** tails a REX player synthesises at render time —
