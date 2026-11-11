@@ -148,6 +148,9 @@ pub struct TracksView {
     /// seconds when it was grabbed). The length stays fixed for the whole drag: scaling by a
     /// length that the drag itself changes would make the marker run away from the pointer.
     flex_drag: Option<(usize, usize, usize, f64)>,
+    /// A Flex Pitch move being dragged: (track, region, index, semitones at the grab, the
+    /// pointer's y at the grab).
+    pitch_drag: Option<(usize, usize, usize, f32, f32)>,
     pub catch: bool,
     /// Global Tempo track above the tracks (Track > Show Tempo Track).
     pub show_tempo: bool,
@@ -297,6 +300,7 @@ impl Default for TracksView {
             tool: TrackTool::Pointer,
             fade_drag: None,
             flex_drag: None,
+            pitch_drag: None,
             catch: true,
             show_tempo: false,
             show_markers: false,
@@ -433,6 +437,39 @@ fn flex_marker_under(p: &Project, t: usize, r: usize, full: Rect, x: f32) -> Opt
     let dst = f64::from(x - full.left()) / per_sec;
     crate::flex_edit::marker_near(&f.markers, dst, f64::from(FLEX_GRAB_W) / per_sec)
         .map(|i| (i, secs))
+}
+
+/// The Flex Pitch move of region `r` of track `t` under `at`, if the pointer is on its bar.
+/// The bar sits at the move's semitones, on the same scale the drawing uses.
+fn pitch_segment_under(p: &Project, t: usize, r: usize, full: Rect, at: Pos2) -> Option<usize> {
+    let a = p.tracks.get(t)?.regions.get(r)?.audio.as_ref()?;
+    let f = a.flex.as_ref()?;
+    let secs = f.length().max(1e-3);
+    if secs <= 0.0 || full.width() <= 0.0 {
+        return None;
+    }
+    let inner = flex_inner(full);
+    let half = pitch_half_height(inner);
+    f.pitch.iter().position(|shift| {
+        let x1 = full.left() + (shift.start / secs) as f32 * full.width();
+        let x2 = full.left() + (shift.end / secs) as f32 * full.width();
+        let y = inner.center().y - shift.semitones / crate::flex_edit::MAX_PITCH_SEMITONES * half;
+        at.x >= x1 && at.x <= x2 && (at.y - y).abs() <= 5.0
+    })
+}
+
+/// Where a region's content starts and ends on screen, below its name bar.
+fn flex_inner(full: Rect) -> Rect {
+    let head_h = 14.0f32.min(full.height() * 0.4);
+    Rect::from_min_max(
+        pos2(full.left(), full.top() + head_h + 2.0),
+        full.max - vec2(0.0, 2.0),
+    )
+}
+
+/// The distance from the middle of a Flex Pitch lane to its top, where the whole range ends.
+fn pitch_half_height(inner: Rect) -> f32 {
+    (inner.height() / 2.0 - 4.0).max(1.0)
 }
 
 /// A double-click on region `r` of track `t` with Flex Time: on a marker it removes it,
@@ -2063,6 +2100,34 @@ fn draw_region(
                 );
             }
         }
+        // Flex Pitch: each moved stretch as a bar at its interval, like a note in the editor.
+        let half = pitch_half_height(inner);
+        for shift in &f.pitch {
+            let x1 = full.left() + (shift.start / secs) as f32 * full.width();
+            let x2 = full.left() + (shift.end / secs) as f32 * full.width();
+            if x2 <= inner.left() || x1 >= inner.right() {
+                continue;
+            }
+            let y =
+                inner.center().y - shift.semitones / crate::flex_edit::MAX_PITCH_SEMITONES * half;
+            let bar = Rect::from_min_max(
+                pos2(x1.max(inner.left()), (y - 3.0).max(inner.top())),
+                pos2(x2.min(inner.right()), (y + 3.0).min(inner.bottom())),
+            );
+            if bar.width() <= 0.0 || bar.height() <= 0.0 {
+                continue;
+            }
+            g.rect_filled(bar, 2.0, Color32::from_rgb(0x6f, 0xcf, 0x97));
+            if bar.width() > 22.0 {
+                g.text(
+                    bar.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{:+.0}", shift.semitones),
+                    FontId::proportional(8.5),
+                    Color32::from_rgb(0x14, 0x2a, 0x1c),
+                );
+            }
+        }
     }
     let ink = if recording {
         Color32::from_rgb(236, 152, 155)
@@ -2853,9 +2918,20 @@ pub fn show(ui: &mut Ui, p: &mut Project, s: &mut UiState, meters: &crate::mixer
                 }
             }
             let fade_tool = v.tool == TrackTool::Fade && p.tracks[ti].kind == TrackKind::Audio;
+            // Flex Pitch bars are smaller targets than the markers: a bar under the pointer
+            // takes it, and a marker is looked for only when there is none.
+            let pitch_hover = if fade_tool {
+                None
+            } else {
+                ui.input(|i| i.pointer.hover_pos())
+                    .and_then(|pt| pitch_segment_under(p, ti, ri, full, pt))
+            };
+            if pitch_hover.is_some() && resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
             // A Flex marker under the pointer: grabbing it stretches the sound; it does not
             // move the region (Logic's Flex Time).
-            let flex_hover = if fade_tool {
+            let flex_hover = if fade_tool || pitch_hover.is_some() {
                 None
             } else {
                 ui.input(|i| i.pointer.hover_pos())
@@ -2864,7 +2940,28 @@ pub fn show(ui: &mut Ui, p: &mut Project, s: &mut UiState, meters: &crate::mixer
             if flex_hover.is_some() && resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
-            let flex_hit = if fade_tool {
+            let pitch_hit = if fade_tool {
+                None
+            } else {
+                ui.input(|i| i.pointer.press_origin())
+                    .or_else(|| resp.interact_pointer_pos())
+                    .and_then(|pt| pitch_segment_under(p, ti, ri, full, pt))
+            };
+            if let (Some(index), true) = (pitch_hit, resp.drag_started()) {
+                if let Some(pt) = ui.input(|i| i.pointer.press_origin()) {
+                    let start = p.tracks[ti].regions[ri]
+                        .audio
+                        .as_ref()
+                        .and_then(|a| a.flex.as_ref())
+                        .and_then(|f| f.pitch.get(index))
+                        .map(|shift| shift.semitones);
+                    if let Some(start) = start {
+                        v.pitch_drag = Some((ti, ri, index, start, pt.y));
+                        s.flex.dragging = true;
+                    }
+                }
+            }
+            let flex_hit = if fade_tool || pitch_hit.is_some() {
                 None
             } else {
                 ui.input(|i| i.pointer.press_origin())
@@ -2878,7 +2975,34 @@ pub fn show(ui: &mut Ui, p: &mut Project, s: &mut UiState, meters: &crate::mixer
             let flex_own = v
                 .flex_drag
                 .is_some_and(|(dt, dr, _, _)| (dt, dr) == (ti, ri));
-            if flex_own {
+            let pitch_own = v
+                .pitch_drag
+                .is_some_and(|(dt, dr, _, _, _)| (dt, dr) == (ti, ri));
+            if pitch_own {
+                // Up moves the note up; whole semitones, between the Flex Pitch limits.
+                if let (true, Some((_, _, index, start, grab_y)), Some(pt)) =
+                    (resp.dragged(), v.pitch_drag, resp.interact_pointer_pos())
+                {
+                    let inner = flex_inner(full);
+                    let per_semitone =
+                        pitch_half_height(inner) / crate::flex_edit::MAX_PITCH_SEMITONES;
+                    if per_semitone > 0.0 {
+                        let semitones = start + (grab_y - pt.y) / per_semitone;
+                        if let Some(f) = p.tracks[ti].regions[ri]
+                            .audio
+                            .as_mut()
+                            .and_then(|a| a.flex.as_mut())
+                        {
+                            crate::flex_edit::set_pitch(&mut f.pitch, index, semitones.round());
+                        }
+                    }
+                }
+                if resp.drag_stopped() {
+                    v.pitch_drag = None;
+                    s.flex.dragging = false;
+                    moved = true;
+                }
+            } else if flex_own {
                 // The dragged marker follows the pointer; the sound is made on release.
                 if let (true, Some((_, _, marker, secs)), Some(pt)) =
                     (resp.dragged(), v.flex_drag, resp.interact_pointer_pos())
@@ -3951,6 +4075,71 @@ mod flex_marker_tests {
             "no marker at half a second: {:?}",
             f.markers.iter().map(|m| m.dst).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_flex_pitch_bar_is_dragged_up_and_down() {
+        let mut p = project_with_marker();
+        {
+            let f = p.tracks[0].regions[0]
+                .audio
+                .as_mut()
+                .unwrap()
+                .flex
+                .as_mut()
+                .unwrap();
+            f.markers.clear();
+            f.pitch = vec![prowave_engine::PitchShift {
+                start: 0.2,
+                end: 0.8,
+                semitones: 0.0,
+            }];
+        }
+        let mut s = UiState::new();
+        let mut h = Harness::new(1200.0, 600.0);
+        let meters = crate::mixer::Meters::default();
+        for _ in 0..2 {
+            h.frame(vec![], |ui| show(ui, &mut p, &mut s, &meters));
+        }
+        // The region runs x 340..464 for two seconds: the move covers 0.2 s to 0.8 s, so its
+        // bar runs x 352.4..389.6. The name bar is 14 points tall, so the pitch lane's middle
+        // is y 91 and half of its 24-semitone range is 14 points.
+        let bar = pos2(371.0, 91.0);
+        h.drag(
+            &[bar, bar - vec2(0.0, 10.0)],
+            PointerButton::Primary,
+            |ui| show(ui, &mut p, &mut s, &meters),
+        );
+        let first = p.tracks[0].regions[0]
+            .audio
+            .as_ref()
+            .unwrap()
+            .flex
+            .as_ref()
+            .unwrap()
+            .pitch[0]
+            .semitones;
+        assert!(first >= 10.0, "moved up to {first}");
+        assert_eq!(p.tracks[0].regions[0].start_bar, 1.0);
+        // Grab the bar at its new height and pull it down: the move goes back toward zero.
+        let at = pos2(
+            371.0,
+            91.0 - first / crate::flex_edit::MAX_PITCH_SEMITONES * 14.0,
+        );
+        h.drag(&[at, at + vec2(0.0, 12.0)], PointerButton::Primary, |ui| {
+            show(ui, &mut p, &mut s, &meters)
+        });
+        let second = p.tracks[0].regions[0]
+            .audio
+            .as_ref()
+            .unwrap()
+            .flex
+            .as_ref()
+            .unwrap()
+            .pitch[0]
+            .semitones;
+        assert!(second < first, "{second} after {first}");
+        assert!(second >= -crate::flex_edit::MAX_PITCH_SEMITONES);
     }
 
     #[test]

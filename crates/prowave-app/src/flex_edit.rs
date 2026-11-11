@@ -374,6 +374,20 @@ pub fn source_at(markers: &[WarpPoint], dst: f64) -> f64 {
     prev.src + (dst - prev.dst)
 }
 
+/// The furthest Flex Pitch moves a note either way, in semitones (two octaves, as Logic's
+/// Flex Pitch correction range).
+pub const MAX_PITCH_SEMITONES: f32 = 24.0;
+
+/// Moves pitch shift `i` to `semitones`, kept within [`MAX_PITCH_SEMITONES`]. A non-finite
+/// value changes nothing.
+pub fn set_pitch(shifts: &mut [PitchShift], i: usize, semitones: f32) {
+    if let Some(shift) = shifts.get_mut(i) {
+        if semitones.is_finite() {
+            shift.semitones = semitones.clamp(-MAX_PITCH_SEMITONES, MAX_PITCH_SEMITONES);
+        }
+    }
+}
+
 /// The markers that make the beats `beats` (seconds into the recording) land on the project's
 /// beats, from the beat nearest the first one on. Also the result's length.
 pub fn follow_tempo(
@@ -1030,6 +1044,26 @@ mod tests {
                 "src {src} at {dst}"
             );
         }
+    }
+
+    #[test]
+    fn a_pitch_move_stays_within_the_flex_pitch_range() {
+        let mut shifts = vec![PitchShift {
+            start: 0.1,
+            end: 0.5,
+            semitones: 0.0,
+        }];
+        set_pitch(&mut shifts, 0, 3.4);
+        assert_eq!(shifts[0].semitones, 3.4);
+        set_pitch(&mut shifts, 0, -100.0);
+        assert_eq!(shifts[0].semitones, -MAX_PITCH_SEMITONES);
+        set_pitch(&mut shifts, 0, f32::NAN);
+        assert_eq!(
+            shifts[0].semitones, -MAX_PITCH_SEMITONES,
+            "a bad value changes nothing"
+        );
+        set_pitch(&mut shifts, 9, 1.0);
+        assert_eq!(shifts[0].semitones, -MAX_PITCH_SEMITONES, "no such move");
     }
 
     #[test]
