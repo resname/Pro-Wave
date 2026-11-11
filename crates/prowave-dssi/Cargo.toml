@@ -2,7 +2,7 @@
 name = "prowave-dssi"
 version = "0.1.0"
 edition = "2021"
-description = "Pro Wave: load DSSI plug-in libraries and read their metadata"
+description = "Pro Wave: in-process DSSI synth plug-in hosting"
 license = "GPL-3.0-or-later"
 
 [dependencies]

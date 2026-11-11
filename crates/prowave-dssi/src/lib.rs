@@ -1,22 +1,24 @@
-//! Loading DSSI plug-in libraries and reading their metadata (Dizzy Soft Synth Interface).
+//! In-process DSSI synth plug-in hosting (Dizzy Soft Synth Interface).
 //!
 //! A DSSI library is a shared object exporting `dssi_descriptor(index)`. Each descriptor wraps
-//! a LADSPA descriptor (ports, ranges and hints) and adds MIDI input, program selection and
-//! configuration on top. [`Library::load`] reads that metadata without running plug-in code.
-//! The synth instance and rendering half follows in its own change.
+//! a LADSPA descriptor (ports, ranges, and the callbacks that instantiate, connect and render)
+//! and adds MIDI input, program selection and configuration on top. [`Library::load`] reads the
+//! metadata without running plug-in code; [`Library::instantiate`] creates a synth instance,
+//! connects its ports, and lets the caller render blocks with MIDI events through
+//! [`Instance::process_with_events`].
 //!
-//! Logic Pro parity: this is the first half of the hosting layer for third-party software
-//! instruments, which Logic exposes as plug-ins on a software instrument track. DSSI is the
-//! Linux synth format requested in issue #64 and follows the in-process LADSPA path in
-//! `prowave-ladspa`; it is not sandboxed. The out-of-process path in `prowave-plugin-host`
-//! remains the default for the formats it supports.
+//! Logic Pro parity: this is the hosting layer for third-party software instruments, which
+//! Logic exposes as plug-ins on a software instrument track. DSSI is the Linux synth format
+//! requested in issue #64 and follows the in-process LADSPA path in `prowave-ladspa`; it is not
+//! sandboxed, so a crashing plug-in can still take Pro Wave down. The out-of-process path in
+//! `prowave-plugin-host` remains the default for the formats it supports.
 //!
 //! DSSI is unsafe by nature: the library is native code running inside Pro Wave. The unsafe
-//! blocks here are limited to loading the library and reading its immutable descriptor tables;
-//! each has a SAFETY comment.
+//! blocks here are limited to loading the library, reading its immutable descriptor tables,
+//! and calling its callbacks; each has a SAFETY comment.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::path::Path;
 use std::sync::Arc;
@@ -25,6 +27,12 @@ use std::sync::Arc;
 const MAX_PLUGINS: usize = 1024;
 /// The most ports one plug-in may have.
 const MAX_PORTS: usize = 512;
+/// The most programs one synth may list.
+const MAX_PROGRAMS: usize = 4096;
+/// The most MIDI events one render block may carry. The instance reserves room for them at
+/// construction, so [`Instance::process_with_events`] never allocates.
+pub const MAX_EVENTS: usize = 256;
+
 /// DSSI 1.0. Every descriptor must declare this API level.
 const DSSI_API_VERSION: c_int = 1;
 
@@ -49,14 +57,26 @@ const HINT_DEFAULT_1: c_int = 0x240;
 const HINT_DEFAULT_100: c_int = 0x280;
 const HINT_DEFAULT_440: c_int = 0x2c0;
 
+/// The `get_midi_controller_for_port` bit saying the value names a MIDI controller.
+pub const DSSI_CC_BITS: i32 = 0x2000_0000;
+/// The `get_midi_controller_for_port` bit saying the value names an NRPN.
+pub const DSSI_NRPN_BITS: i32 = 0x4000_0000;
+/// `get_midi_controller_for_port`'s "no controller" answer.
+pub const DSSI_NONE: i32 = -1;
+
+/// The ALSA event types DSSI uses for MIDI.
+const EVENT_NOTE_ON: u8 = 6;
+const EVENT_NOTE_OFF: u8 = 7;
+const EVENT_CONTROLLER: u8 = 10;
+const EVENT_CHANNEL_PRESSURE: u8 = 12;
+const EVENT_PITCH_BEND: u8 = 13;
+
 /// The sample rate used to scale `LADSPA_HINT_SAMPLE_RATE` defaults in [`PluginInfo`]. A plug-in
 /// instance still gets the session's real rate.
 const METADATA_RATE: f32 = 44_100.0;
 
-/// The C layout of `LADSPA_Descriptor`. The callbacks are part of the ABI; this half reads
-/// only the metadata (ids, names, ports, hints), so the rest is allowed to go unread.
+/// The C layout of `LADSPA_Descriptor`.
 #[repr(C)]
-#[allow(dead_code)]
 struct RawLadspaDescriptor {
     unique_id: c_ulong,
     label: *const c_char,
@@ -87,10 +107,8 @@ struct RawRangeHint {
     upper_bound: f32,
 }
 
-/// The C layout of `DSSI_Descriptor` (DSSI 1.0). Fields the loader does not read are part of
-/// the ABI and are allowed to go unread.
+/// The C layout of `DSSI_Descriptor` (DSSI 1.0).
 #[repr(C)]
-#[allow(dead_code)]
 struct RawDssiDescriptor {
     api_version: c_int,
     ladspa_plugin: *const RawLadspaDescriptor,
@@ -99,14 +117,13 @@ struct RawDssiDescriptor {
     get_program: Option<unsafe extern "C" fn(*mut c_void, c_ulong) -> *const RawProgramDescriptor>,
     select_program: Option<unsafe extern "C" fn(*mut c_void, c_ulong, c_ulong)>,
     get_midi_controller_for_port: Option<unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int>,
-    /// The event table type is defined by the render half; the pointer is never called here.
-    run_synth: Option<unsafe extern "C" fn(*mut c_void, c_ulong, *mut c_void, c_ulong)>,
-    run_synth_adding: Option<unsafe extern "C" fn(*mut c_void, c_ulong, *mut c_void, c_ulong)>,
+    run_synth: Option<unsafe extern "C" fn(*mut c_void, c_ulong, *mut SeqEvent, c_ulong)>,
+    run_synth_adding: Option<unsafe extern "C" fn(*mut c_void, c_ulong, *mut SeqEvent, c_ulong)>,
     run_multiple_synths: Option<
-        unsafe extern "C" fn(c_ulong, *mut *mut c_void, c_ulong, *mut *mut c_void, *mut c_ulong),
+        unsafe extern "C" fn(c_ulong, *mut *mut c_void, c_ulong, *mut *mut SeqEvent, *mut c_ulong),
     >,
     run_multiple_synths_adding: Option<
-        unsafe extern "C" fn(c_ulong, *mut *mut c_void, c_ulong, *mut *mut c_void, *mut c_ulong),
+        unsafe extern "C" fn(c_ulong, *mut *mut c_void, c_ulong, *mut *mut SeqEvent, *mut c_ulong),
     >,
 }
 
@@ -116,6 +133,198 @@ struct RawProgramDescriptor {
     bank: c_ulong,
     program: c_ulong,
     name: *const c_char,
+}
+
+/// `snd_seq_ev_note_t` from ALSA's `seq_event.h`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeqNote {
+    channel: u8,
+    note: u8,
+    velocity: u8,
+    off_velocity: u8,
+    duration: u32,
+}
+
+/// `snd_seq_ev_ctrl_t` from ALSA's `seq_event.h`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeqCtrl {
+    channel: u8,
+    unused: [u8; 3],
+    param: u32,
+    value: i32,
+}
+
+/// `snd_seq_event_data_t`: twelve bytes in every ALSA build.
+#[repr(C)]
+#[derive(Clone, Copy)]
+union SeqData {
+    note: SeqNote,
+    control: SeqCtrl,
+    raw: [u8; 12],
+}
+
+/// `snd_seq_timestamp_t`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+union SeqTimestamp {
+    tick: u32,
+    time: SeqRealTime,
+}
+
+/// `snd_seq_real_time_t`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeqRealTime {
+    tv_sec: u32,
+    tv_nsec: u32,
+}
+
+/// `snd_seq_addr_t`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeqAddr {
+    client: u8,
+    port: u8,
+}
+
+/// The C layout of `snd_seq_event_t`, which DSSI passes to `run_synth`. It is 28 bytes; the
+/// plugin reads the frame count from the tick field of `time` and MIDI data from `data`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeqEvent {
+    event_type: u8,
+    flags: u8,
+    tag: u8,
+    queue: u8,
+    time: SeqTimestamp,
+    source: SeqAddr,
+    dest: SeqAddr,
+    data: SeqData,
+}
+
+/// One MIDI message for [`Instance::process_with_events`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    NoteOn {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    ControlChange {
+        channel: u8,
+        controller: u8,
+        value: u8,
+    },
+    /// `value` is the MIDI pitch wheel position, -8192 to 8191.
+    PitchBend {
+        channel: u8,
+        value: i16,
+    },
+    ChannelPressure {
+        channel: u8,
+        pressure: u8,
+    },
+}
+
+impl Event {
+    fn raw(self, frame: u32) -> SeqEvent {
+        let (event_type, data) = match self {
+            Event::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => (
+                EVENT_NOTE_ON,
+                SeqData {
+                    note: SeqNote {
+                        channel,
+                        note,
+                        velocity,
+                        off_velocity: 0,
+                        duration: 0,
+                    },
+                },
+            ),
+            Event::NoteOff {
+                channel,
+                note,
+                velocity,
+            } => (
+                EVENT_NOTE_OFF,
+                SeqData {
+                    note: SeqNote {
+                        channel,
+                        note,
+                        velocity,
+                        off_velocity: 0,
+                        duration: 0,
+                    },
+                },
+            ),
+            Event::ControlChange {
+                channel,
+                controller,
+                value,
+            } => (
+                EVENT_CONTROLLER,
+                SeqData {
+                    control: SeqCtrl {
+                        channel,
+                        unused: [0; 3],
+                        param: u32::from(controller),
+                        value: i32::from(value),
+                    },
+                },
+            ),
+            Event::PitchBend { channel, value } => (
+                EVENT_PITCH_BEND,
+                SeqData {
+                    control: SeqCtrl {
+                        channel,
+                        unused: [0; 3],
+                        param: 0,
+                        value: i32::from(value),
+                    },
+                },
+            ),
+            Event::ChannelPressure { channel, pressure } => (
+                EVENT_CHANNEL_PRESSURE,
+                SeqData {
+                    control: SeqCtrl {
+                        channel,
+                        unused: [0; 3],
+                        param: 0,
+                        value: i32::from(pressure),
+                    },
+                },
+            ),
+        };
+        SeqEvent {
+            event_type,
+            flags: 0,
+            tag: 0,
+            queue: 0,
+            time: SeqTimestamp { tick: frame },
+            source: SeqAddr { client: 0, port: 0 },
+            dest: SeqAddr { client: 0, port: 0 },
+            data,
+        }
+    }
+}
+
+/// One MIDI event and the frame within the block at which it starts. DSSI wants events already
+/// ordered by time; [`Instance::process_with_events`] refuses a decreasing frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedEvent {
+    pub frame: u32,
+    pub event: Event,
 }
 
 /// What a port carries.
@@ -254,8 +463,6 @@ pub struct Library {
 struct Inner {
     /// Kept alive so the descriptors and code stay mapped.
     _library: libloading::Library,
-    /// The raw descriptors; the render half instantiates from them.
-    #[allow(dead_code)]
     descriptors: Vec<*const RawDssiDescriptor>,
     plugins: Vec<PluginInfo>,
 }
@@ -320,6 +527,11 @@ impl Library {
     pub fn plugins(&self) -> &[PluginInfo] {
         &self.inner.plugins
     }
+
+    /// Instantiates class `index` at `sample_rate`.
+    pub fn instantiate(&self, index: usize, sample_rate: u32) -> Result<Instance, Error> {
+        Instance::new(self.inner.clone(), index, sample_rate)
+    }
 }
 
 impl std::fmt::Debug for Library {
@@ -327,6 +539,380 @@ impl std::fmt::Debug for Library {
         f.debug_struct("Library")
             .field("plugins", &self.inner.plugins)
             .finish()
+    }
+}
+
+/// One running DSSI synth, with its ports connected.
+pub struct Instance {
+    /// Keeps the code and descriptors alive until the instance is cleaned up.
+    _inner: Arc<Inner>,
+    handle: *mut c_void,
+    connect_port: unsafe extern "C" fn(*mut c_void, c_ulong, *mut f32),
+    run: Option<unsafe extern "C" fn(*mut c_void, c_ulong)>,
+    run_synth: Option<unsafe extern "C" fn(*mut c_void, c_ulong, *mut SeqEvent, c_ulong)>,
+    deactivate: Option<unsafe extern "C" fn(*mut c_void)>,
+    cleanup: Option<unsafe extern "C" fn(*mut c_void)>,
+    configure:
+        Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> *mut c_char>,
+    get_program: Option<unsafe extern "C" fn(*mut c_void, c_ulong) -> *const RawProgramDescriptor>,
+    select_program: Option<unsafe extern "C" fn(*mut c_void, c_ulong, c_ulong)>,
+    midi_controller_for_port: Option<unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int>,
+    audio_in: Vec<usize>,
+    audio_out: Vec<usize>,
+    controls: Vec<Control>,
+    /// One value per control port, in `controls` order. The buffer is allocated once and its
+    /// addresses are what the plug-in reads, so it must never grow after connecting.
+    values: Vec<f32>,
+    /// Room for one block's MIDI events, reserved at construction so rendering never allocates.
+    events: Vec<SeqEvent>,
+}
+
+struct Control {
+    port: usize,
+    slot: usize,
+    output: bool,
+    /// Only the bounds the plug-in declares; an unbounded side is `None`.
+    min: Option<f32>,
+    max: Option<f32>,
+}
+
+// SAFETY: a DSSI instance is meant to be used by one thread at a time. Moving it to the audio
+// thread after creation is the normal host pattern; it is not `Sync`.
+unsafe impl Send for Instance {}
+
+impl Instance {
+    fn new(inner: Arc<Inner>, index: usize, sample_rate: u32) -> Result<Self, Error> {
+        let raw = *inner.descriptors.get(index).ok_or(Error::NoSuchPlugin)?;
+        // SAFETY: `raw` is one of the descriptors read in `Library::load`; the library is still
+        // mapped through `inner`.
+        let dssi = unsafe { &*raw };
+        if dssi.ladspa_plugin.is_null() {
+            return Err(Error::Malformed("LADSPA descriptor"));
+        }
+        // SAFETY: DSSI requires every descriptor to point at a live LADSPA descriptor.
+        let ladspa = unsafe { &*dssi.ladspa_plugin };
+        let instantiate = ladspa
+            .instantiate
+            .ok_or(Error::Unsupported("instantiate"))?;
+        let connect_port = ladspa
+            .connect_port
+            .ok_or(Error::Unsupported("connect_port"))?;
+        // SAFETY: the descriptor's `instantiate` takes its own descriptor and a sample rate, as
+        // the LADSPA ABI specifies.
+        let handle = unsafe { instantiate(dssi.ladspa_plugin, sample_rate as c_ulong) };
+        if handle.is_null() {
+            return Err(Error::Instantiate);
+        }
+
+        let info = &inner.plugins[index];
+        let port_count = usize::try_from(ladspa.port_count).unwrap_or(0);
+        let raw_hints = if ladspa.port_range_hints.is_null() {
+            None
+        } else {
+            // SAFETY: the descriptor's port count bounds its hint table, which stays mapped
+            // through `inner`; the slice is only read here.
+            Some(unsafe { std::slice::from_raw_parts(ladspa.port_range_hints, port_count) })
+        };
+        let mut audio_in = Vec::new();
+        let mut audio_out = Vec::new();
+        let mut controls = Vec::new();
+        let mut values = Vec::new();
+        for port in &info.ports {
+            match port.kind {
+                PortKind::AudioInput => audio_in.push(port.index),
+                PortKind::AudioOutput => audio_out.push(port.index),
+                PortKind::ControlInput | PortKind::ControlOutput => {
+                    // Sample-rate-scaled bounds and defaults must use this instance's rate,
+                    // not the rate the UI metadata was computed at.
+                    let range = raw_hints
+                        .and_then(|hints| hints.get(port.index))
+                        .map(|hint| hint_values(hint, sample_rate as f32))
+                        .unwrap_or(HintValues {
+                            // No hints: the plug-in declares no bounds, so none are invented.
+                            min: None,
+                            max: None,
+                            default: 0.0,
+                            toggled: false,
+                            integer: false,
+                            logarithmic: false,
+                        });
+                    let slot = values.len();
+                    values.push(if port.kind == PortKind::ControlInput {
+                        range.default
+                    } else {
+                        0.0
+                    });
+                    controls.push(Control {
+                        port: port.index,
+                        slot,
+                        output: port.kind == PortKind::ControlOutput,
+                        min: range.min,
+                        max: range.max,
+                    });
+                }
+            }
+        }
+
+        // The values buffer is complete now; connect its stable addresses.
+        for control in &controls {
+            // SAFETY: `handle` is the instance just created, each port index belongs to the
+            // descriptor, and the pointer refers to `values[slot]`, which lives in the instance
+            // until it is dropped.
+            unsafe {
+                connect_port(
+                    handle,
+                    control.port as c_ulong,
+                    values.as_mut_ptr().add(control.slot),
+                );
+            }
+        }
+        if let Some(activate) = ladspa.activate {
+            // SAFETY: `activate` is the plug-in's own callback for this handle.
+            unsafe { activate(handle) };
+        }
+        Ok(Self {
+            _inner: inner,
+            handle,
+            connect_port,
+            run: ladspa.run,
+            run_synth: dssi.run_synth,
+            deactivate: ladspa.deactivate,
+            cleanup: ladspa.cleanup,
+            configure: dssi.configure,
+            get_program: dssi.get_program,
+            select_program: dssi.select_program,
+            midi_controller_for_port: dssi.get_midi_controller_for_port,
+            audio_in,
+            audio_out,
+            controls,
+            values,
+            events: Vec::with_capacity(MAX_EVENTS),
+        })
+    }
+
+    /// The number of audio input ports and audio output ports.
+    pub fn audio_port_counts(&self) -> (usize, usize) {
+        (self.audio_in.len(), self.audio_out.len())
+    }
+
+    /// Renders one block with no MIDI events.
+    pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) -> Result<(), Error> {
+        self.process_with_events(inputs, outputs, &[])
+    }
+
+    /// Renders one block, delivering `events` to the synth. Each slice is one audio port, in
+    /// port order. The block length is the shortest of all input and output slices, so a synth
+    /// with no audio inputs uses its output length; empty buffers do nothing. Events must be in
+    /// nondecreasing frame order and their frames are relative to the start of the block.
+    ///
+    /// The instance reserves room for [`MAX_EVENTS`] events when it is created; this method
+    /// allocates nothing.
+    pub fn process_with_events(
+        &mut self,
+        inputs: &[&[f32]],
+        outputs: &mut [&mut [f32]],
+        events: &[TimedEvent],
+    ) -> Result<(), Error> {
+        if inputs.len() != self.audio_in.len() || outputs.len() != self.audio_out.len() {
+            return Err(Error::PortCount {
+                expected_inputs: self.audio_in.len(),
+                expected_outputs: self.audio_out.len(),
+                inputs: inputs.len(),
+                outputs: outputs.len(),
+            });
+        }
+        if events.len() > MAX_EVENTS {
+            return Err(Error::TooManyEvents {
+                max: MAX_EVENTS,
+                got: events.len(),
+            });
+        }
+        let frames = inputs
+            .iter()
+            .map(|input| input.len())
+            .chain(outputs.iter().map(|output| output.len()))
+            .min()
+            .unwrap_or(0);
+        if frames == 0 {
+            return Ok(());
+        }
+        self.events.clear();
+        let mut previous = 0;
+        for (index, event) in events.iter().enumerate() {
+            // A frame past the block would let the plug-in read or write outside the buffers.
+            if u64::from(event.frame) >= frames as u64 {
+                return Err(Error::EventPastBlock {
+                    frame: event.frame,
+                    frames,
+                });
+            }
+            if index > 0 && event.frame < previous {
+                return Err(Error::UnorderedEvents {
+                    previous,
+                    frame: event.frame,
+                });
+            }
+            previous = event.frame;
+            self.events.push(event.event.raw(event.frame));
+        }
+        for (port, input) in self.audio_in.iter().zip(inputs) {
+            // SAFETY: LADSPA `connect_port` takes a mutable pointer, but an audio input port is
+            // read-only by the API contract; the plug-in must not write it. The buffer lives for
+            // the duration of the render call.
+            unsafe {
+                (self.connect_port)(self.handle, *port as c_ulong, input.as_ptr() as *mut f32);
+            }
+        }
+        for (port, output) in self.audio_out.iter().zip(outputs.iter_mut()) {
+            // SAFETY: an audio output port points at this block's writable buffer, which lives
+            // for the duration of the render call.
+            unsafe {
+                (self.connect_port)(self.handle, *port as c_ulong, output.as_mut_ptr());
+            }
+        }
+        if let Some(run_synth) = self.run_synth {
+            // SAFETY: `run_synth` is the plug-in's render callback; all ports were connected
+            // and the event table matches its documented ALSA layout.
+            unsafe {
+                let mut_ptr = if self.events.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.events.as_mut_ptr()
+                };
+                run_synth(
+                    self.handle,
+                    frames as c_ulong,
+                    mut_ptr,
+                    self.events.len() as c_ulong,
+                );
+            }
+        } else if self.events.is_empty() {
+            if let Some(run) = self.run {
+                // SAFETY: LADSPA `run` renders the block; it is documented to behave like
+                // `run_synth` with no events.
+                unsafe { run(self.handle, frames as c_ulong) };
+            } else {
+                return Err(Error::Unsupported("run or run_synth"));
+            }
+        } else {
+            return Err(Error::Unsupported("run_synth"));
+        }
+        Ok(())
+    }
+
+    /// Sets control input `port` to `value`, clamped only to the bounds the plug-in declares
+    /// (an unbounded side leaves the value as given).
+    pub fn set_control(&mut self, port: usize, value: f32) -> Result<(), Error> {
+        if !value.is_finite() {
+            return Err(Error::BadValue);
+        }
+        let (slot, min, max) = self
+            .controls
+            .iter()
+            .find(|control| control.port == port && !control.output)
+            .map(|control| (control.slot, control.min, control.max))
+            .ok_or(Error::BadPort(port))?;
+        self.values[slot] = clamp_value(value, min, max);
+        Ok(())
+    }
+
+    /// The current value of control `port` (input or output). A synth may rewrite input
+    /// controls when a program is selected, so this is the live value, not the setting.
+    pub fn control(&self, port: usize) -> Option<f32> {
+        self.controls
+            .iter()
+            .find(|control| control.port == port)
+            .map(|control| self.values[control.slot])
+    }
+
+    /// Every program the synth lists, in `get_program` order. Empty when it has none.
+    pub fn programs(&self) -> Vec<ProgramDescriptor> {
+        let Some(get_program) = self.get_program else {
+            return Vec::new();
+        };
+        let mut programs = Vec::new();
+        for index in 0..MAX_PROGRAMS {
+            // SAFETY: `get_program` belongs to this instance's descriptor and returns NULL past
+            // the last program. The name is copied before the next call invalidates it.
+            let raw = unsafe { get_program(self.handle, index as c_ulong) };
+            if raw.is_null() {
+                break;
+            }
+            // SAFETY: the non-null descriptor stays valid until the next call; its name is a
+            // NUL-terminated string owned by the plug-in.
+            let raw = unsafe { &*raw };
+            programs.push(ProgramDescriptor {
+                // `c_ulong` is 32-bit on Windows and 64-bit elsewhere; the cast is needed there
+                // even though it is a no-op on this target.
+                #[allow(clippy::unnecessary_cast)]
+                bank: raw.bank as u64,
+                #[allow(clippy::unnecessary_cast)]
+                program: raw.program as u64,
+                name: unsafe { string(raw.name) },
+            });
+        }
+        programs
+    }
+
+    /// Selects a program by its bank and program numbers. The change takes effect at the next
+    /// render; the synth may rewrite its input control values as it does so.
+    pub fn select_program(&mut self, bank: u64, program: u64) -> Result<(), Error> {
+        let select = self
+            .select_program
+            .ok_or(Error::Unsupported("select_program"))?;
+        // SAFETY: `select` belongs to this instance's descriptor and takes its handle.
+        unsafe {
+            select(self.handle, bank as c_ulong, program as c_ulong);
+        }
+        Ok(())
+    }
+
+    /// Sends a piece of configuration to the synth. Keys starting with `DSSI:` are reserved by
+    /// the specification (for example `DSSI:PROJECT_DIRECTORY`); a synth may refuse any key,
+    /// and its message is returned in [`Error::Configured`].
+    pub fn configure(&mut self, key: &str, value: &str) -> Result<(), Error> {
+        let configure = self.configure.ok_or(Error::Unsupported("configure"))?;
+        let key = CString::new(key).map_err(|_| Error::BadValue)?;
+        let value = CString::new(value).map_err(|_| Error::BadValue)?;
+        // SAFETY: `configure` belongs to this instance's descriptor, and both pointers are
+        // valid NUL-terminated strings for the duration of the call.
+        let error = unsafe { configure(self.handle, key.as_ptr(), value.as_ptr()) };
+        if error.is_null() {
+            return Ok(());
+        }
+        // SAFETY: DSSI says a non-NULL return is the plug-in's error string, which the host
+        // frees. It is read before being freed.
+        let message = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: the string was allocated by the plug-in with the C allocator, as DSSI
+        // requires, and the host owns it now. This assumes the plug-in and the host use the
+        // same C runtime (the system libc, as DSSI plug-ins do on Linux).
+        unsafe { libc::free(error as *mut c_void) };
+        Err(Error::Configured(message))
+    }
+
+    /// The MIDI controller the synth wants mapped to control `port`, or `None` when it wants
+    /// none. The value uses the `DSSI_CC_BITS`/`DSSI_NRPN_BITS` encoding; see [`DSSI_NONE`].
+    pub fn midi_controller_for_port(&self, port: usize) -> Option<i32> {
+        let map = self.midi_controller_for_port?;
+        // SAFETY: `map` belongs to this instance's descriptor; the port is an input control
+        // that the caller found in `PluginInfo::ports`.
+        let value = unsafe { map(self.handle, port as c_ulong) };
+        (value != DSSI_NONE).then_some(value)
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if let Some(deactivate) = self.deactivate {
+            // SAFETY: `deactivate` is the plug-in's callback for this handle, called once.
+            unsafe { deactivate(self.handle) };
+        }
+        if let Some(cleanup) = self.cleanup {
+            // SAFETY: `cleanup` frees the instance created by `instantiate`; called once.
+            unsafe { cleanup(self.handle) };
+        }
     }
 }
 
@@ -522,6 +1108,38 @@ unsafe fn string(pointer: *const c_char) -> String {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn the_alsa_event_matches_the_c_layout() {
+        // `snd_seq_event_t` is 28 bytes: four one-byte fields, an eight-byte timestamp, two
+        // two-byte addresses and the twelve-byte data union.
+        assert_eq!(std::mem::size_of::<SeqEvent>(), 28);
+        assert_eq!(std::mem::size_of::<SeqNote>(), 8);
+        assert_eq!(std::mem::size_of::<SeqCtrl>(), 12);
+        assert_eq!(std::mem::size_of::<SeqData>(), 12);
+        assert_eq!(std::mem::size_of::<SeqTimestamp>(), 8);
+        assert_eq!(std::mem::size_of::<SeqAddr>(), 2);
+        assert_eq!(std::mem::offset_of!(SeqEvent, time), 4);
+        assert_eq!(std::mem::offset_of!(SeqEvent, source), 12);
+        assert_eq!(std::mem::offset_of!(SeqEvent, dest), 14);
+        assert_eq!(std::mem::offset_of!(SeqEvent, data), 16);
+    }
+
+    #[test]
+    fn events_carry_their_frame_and_message() {
+        let raw = Event::NoteOn {
+            channel: 3,
+            note: 60,
+            velocity: 100,
+        }
+        .raw(17);
+        assert_eq!(raw.event_type, EVENT_NOTE_ON);
+        // SAFETY: the event was just built with its note field.
+        let note = unsafe { raw.data.note };
+        assert_eq!((note.channel, note.note, note.velocity), (3, 60, 100));
+        // SAFETY: the event was just built with its tick field.
+        assert_eq!(unsafe { raw.time.tick }, 17);
+    }
 
     fn hint(flags: c_int, lower: f32, upper: f32) -> RawRangeHint {
         RawRangeHint {
